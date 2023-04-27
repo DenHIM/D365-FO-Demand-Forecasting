@@ -36,15 +36,20 @@ param (
 
     [Parameter(Mandatory)]
     [string]
+    $vmPrefix,
+
+    [Parameter(Mandatory)]
+    [string]
     $AADApplicationName
 )
 
 $storageContainer = "demplan-azureml"  #should not be changed
-$computeCluster_Name = "e2ecpucluster" #should not be changed
+$computeInstance_Name = "$vmPrefix-scriptExec"
+$computeCluster_Name = "$vmPrefix-e2ecpucluster"
 
 function Set-SubscriptionContext{
-	# check the subscription
-	$res = az account list --query "[?id=='$subscriptionId'].id" --output tsv
+    # check the subscription
+    $res = az account list --query "[?id=='$subscriptionId'].id" --output tsv
     if ([string]::IsNullOrEmpty($res)) {
         Write-Warning "Subscription $subscriptionId is not valid for the current account."
         throw
@@ -119,13 +124,13 @@ function Create-StorageAccount() {
 
     # create a BLOB container used by forecast logic
     $res = az storage container create --name $storageContainer --account-name $storageAccountName --resource-group $resourceGroupName --account-key $storageAccessKey
-		if ($LASTEXITCODE -ne 0) {
-		# failed creating BLOB container
-		Write-Warning "Error while trying to create a BLOB container."
-		throw $res
+        if ($LASTEXITCODE -ne 0) {
+        # failed creating BLOB container
+        Write-Warning "Error while trying to create a BLOB container."
+        throw $res
     }
 
-	# create a lifetime policy to auto delete blob in the forecast container
+    # create a lifetime policy to auto delete blob in the forecast container
     $rule = @{ definition = @{actions = @{baseBlob = @{delete = @{daysAfterModificationGreaterThan = $BlobDeleteAfterDaysNumber}}}; filters = @{blobTypes = ,"blockBlob"; prefixMatch = ,$storageContainer}}; type = "Lifecycle"; name = $ruleName; enabled = $true;}
     $jsonPolicy = @{ rules = ,$rule; } | ConvertTo-json -Depth 10 -Compress
     $jsonPolicy = $jsonPolicy -replace '"', '\"'
@@ -138,12 +143,36 @@ function Create-StorageAccount() {
     }
 }
 
+# WriteYml function that writes the YML content to a file
+function CreateTMPYml {
+    param (
+        $fileName,
+        $name, #name
+        $accountName, #account_name
+        $containerName, #container_name
+        $accountKey #account_key
+    )
+    # Initialize YML file contents
+    $yml = `
+"`$schema: https://azuremlschemas.azureedge.net/latest/azureBlob.schema.json
+name: $name
+type: azure_blob
+description: Datastore pointing to a blob container.
+account_name: $accountName
+container_name: $containerName
+credentials:
+  account_key: $accountKey"
+    
+    Set-Content -Path $fileName -Value $yml
+}
+
 function Create-Workspace() {
     $WorkSpaceBlobDefaultDS = "workspaceblobdemplan"
 
     # create ML workspace
     Write-Host "Creating an ML workspace $workspaceName ..."
-    $res = az ml workspace create --workspace-name $workspaceName --resource-group $resourceGroupName --storage-account $storageAccountId
+    $res = az ml workspace create --name $workspaceName --resource-group $resourceGroupName
+    #$res = az ml workspace create --workspace-name $workspaceName --resource-group $resourceGroupName --storage-account $storageAccountId
 
     if ($LASTEXITCODE -ne 0) {
         # failed creating ML workspace
@@ -151,12 +180,25 @@ function Create-Workspace() {
         throw $res
     }
 
-    $script:workspaceId = az ml workspace show --resource-group $resourceGroupName --workspace-name $workspaceName --query "id" --output tsv
+    $script:workspaceId = az ml workspace show --name $workspaceName --resource-group $resourceGroupName --query "id" --output tsv
+    Write-Warning "Workspace ID is $workspaceId."
+
+    if (-Not $workspaceId) {
+        # failed creating ML workspace
+        Write-Warning "Workspace ID has not been retrieved."
+        throw
+    }
+
+    Write-Host "Creating BLOB YML file ..."
+    $tmpYmlFileName = "TMP_blob.yml"
+    CreateTMPYml -fileName $tmpYmlFileName -name $WorkSpaceBlobDefaultDS -accountName $storageAccountName `
+        -containerName $storageContainer -accountKey $storageAccessKey
 
     Write-Host "Setting up an ML workspace datastore ..."
-    $res = az ml datastore attach-blob --account-name $storageAccountName --container-name $storageContainer --name $WorkSpaceBlobDefaultDS `
-        --account-key $storageAccessKey --workspace-name $workspaceName --resource-group $resourceGroupName `
-        --storage-account-resource-group $resourceGroupName --storage-account-subscription-id $subscriptionId
+    $res = az ml datastore create --file $tmpYmlFileName --workspace-name $workspaceName --resource-group $resourceGroupName
+
+    Write-Host "Deleting BLOB YML file ..."
+    Remove-Item $tmpYmlFileName
 
     if ($LASTEXITCODE -ne 0) {
         # failed attaching datastore
@@ -164,25 +206,25 @@ function Create-Workspace() {
         throw $res
     }
 
-    $res = az ml datastore set-default --name $WorkSpaceBlobDefaultDS --resource-group $resourceGroupName --workspace-name $WorkspaceName
+    #$res = az ml datastore set-default --name $WorkSpaceBlobDefaultDS --resource-group $resourceGroupName --workspace-name $WorkspaceName
 
-    if ($LASTEXITCODE -ne 0) {
+    #if ($LASTEXITCODE -ne 0) {
         # failed setting default datastore
-        Write-Warning "Error while trying to set up a default ML datastore."
-        throw $res
-    }
+    #    Write-Warning "Error while trying to set up a default ML datastore."
+    #    throw $res
+    #}
 
-	# make sure access keys are in sync
-    az ml workspace sync-keys  --workspace-name $WorkspaceName --resource-group $resourceGroupName
+    # make sure access keys are in sync
+    az ml workspace sync-keys  --name $workspaceName --resource-group $resourceGroupName
 }
 
 function Create-ComputeInstance() {
-    $computeInstance_Name = "notebookScryptExecutor"
     $computeInstance_vm_size = "Standard_D3_v2"
 
     # create workspace compute instance
     Write-Host "Creating an ML workspace compute instance ..."
-    $res = az ml computetarget create computeinstance --name $computeInstance_Name --resource-group $resourceGroupName --workspace-name $workspaceName --vm-size $computeInstance_vm_size
+    $res = az ml compute create --type ComputeInstance --name $computeInstance_Name --resource-group $resourceGroupName --workspace-name $workspaceName `
+        --size $computeInstance_vm_size
 
     if ($LASTEXITCODE -ne 0) {
         # failed creating workspace compute instance
@@ -198,8 +240,8 @@ function Create-ComputeCluster() {
 
     # create workspace compute cluster
     Write-Host "Creating an ML workspace compute cluster ..."
-    $res = az ml computetarget create amlcompute --name $computeCluster_Name --resource-group $resourceGroupName --workspace-name $workspaceName `
-        --min-nodes $computeCluster_min_nodes --max-nodes $computeCluster_max_nodes --vm-size $computeCluster_vm_size
+    $res = az ml compute create --type AmlCompute --name $computeCluster_Name --resource-group $resourceGroupName --workspace-name $workspaceName `
+        --size $computeCluster_vm_size --min-instances  $computeCluster_min_nodes --max-instances $computeCluster_max_nodes
 
     if ($LASTEXITCODE -ne 0) {
         # failed creating compute cluster
@@ -249,12 +291,12 @@ function Create-AppWithPrincipal{
 
 function Display-ScriptResult{
     $azureTenantId = az account show --query "tenantId" --output tsv
-	$documentationLink = "https://go.microsoft.com/fwlink/?linkid=2165514"
+    $documentationLink = "https://go.microsoft.com/fwlink/?linkid=2165514"
 
-	Write-Host "`nDemand forecast setup script has completed."
-	Write-Host "Please create an application secret explicitly and proceed with workspace pipeline configuration according to public documentation: $documentationLink"
+    Write-Host "`nDemand forecast setup script has completed."
+    Write-Host "Please create an application secret explicitly and proceed with workspace pipeline configuration according to public documentation: $documentationLink"
     
-	# display information needed by FinOps for AML demand forecast	
+    # display information needed by FinOps for AML demand forecast  
     Write-Host "`nDemand forecast parameters.`n"
     Write-Host "Azure tenant id: $azureTenantId"
     Write-Host "Storage account name: $storageAccountName"
@@ -281,6 +323,13 @@ function Do-ResourcesCleanUp {
     }
 }
 
+function Upload_SampleInput {
+    # https://learn.microsoft.com/en-us/dynamics365/supply-chain/master-planning/demand-forecasting-setup#ml-workspace-script
+    # 3. In Azure Machine Learning studio, upload the sampleInput.csv file that you downloaded in step 1...
+    $sampleFileName = "sampleInput.csv"
+    az storage blob upload --file $sampleFileName --container-name $storageContainer --name $sampleFileName --account-name $storageAccountName
+}
+
 #====
 
 $ErrorActionPreference = "Stop"
@@ -290,7 +339,7 @@ if (-not $isAzInstalled) {
     throw "AZ CLI is not installed, please go get it at: https://docs.microsoft.com/en-us/cli/azure/install-azure-cli"
 }
 
-$mlExtensionName =  az extension list --query "[?name=='azure-cli-ml'].name" --output tsv
+$mlExtensionName =  az extension list --query "[?name=='ml'].name" --output tsv
 if ([string]::IsNullOrEmpty($mlExtensionName)){
     throw "ML extension for AZ CLI azure-cli-ml is not installed. Please install it, see: https://docs.microsoft.com/en-us/cli/azure/install-azure-cli"
 }
@@ -334,3 +383,6 @@ catch
 
     Do-ResourcesCleanUp
 }
+
+# Upload sample file
+Upload_SampleInput
