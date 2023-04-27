@@ -236,7 +236,8 @@ function Create-ComputeInstance() {
 function Create-ComputeCluster() {
     $computeCluster_min_nodes = 0
     $computeCluster_max_nodes = 6 
-    $computeCluster_vm_size = "STANDARD_DS3_V2"
+    #$computeCluster_vm_size = "STANDARD_DS3_V2"
+    $computeCluster_vm_size = "Standard_E4ads_v5"
 
     # create workspace compute cluster
     Write-Host "Creating an ML workspace compute cluster ..."
